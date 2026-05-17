@@ -1,0 +1,17 @@
+{
+  "name": "wechat-coze-relay",
+  "version": "1.0.0",
+  "description": "Relay WeChat Official Account text messages to Coze v3 Chat API",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "fast-xml-parser": "^4.4.1"
+  }
+}
