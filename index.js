@@ -5,37 +5,24 @@ import { XMLParser } from "fast-xml-parser";
 const app = express();
 
 app.use(express.text({
-  type: ["text/*", "application/xml", "*/xml", "*/*"],
-  limit: "1mb"
+  type: ["text/*", "application/xml", "*/xml", "*/*"]
 }));
 
 const parser = new XMLParser({
-  ignoreAttributes: true,
-  trimValues: false
+  ignoreAttributes: true
 });
 
 const {
   PORT = 3000,
   WECHAT_TOKEN,
-  WECHAT_APP_ID,
-  WECHAT_APP_SECRET,
   COZE_API_TOKEN,
   COZE_BOT_ID,
-  COZE_API_BASE = "https://api.coze.cn",
-  WAITING_REPLY = "收到，我正在思考，请稍等一下。",
-  ERROR_REPLY = "抱歉，我暂时无法回复，请稍后再试。"
+  COZE_API_BASE = "https://api.coze.cn"
 } = process.env;
 
-let cachedAccessToken = "";
-let cachedAccessTokenExpireAt = 0;
-const processing = new Map();
-
 function checkWechatSignature(signature, timestamp, nonce) {
-  if (!signature || !timestamp || !nonce || !WECHAT_TOKEN) return false;
-
   const raw = [WECHAT_TOKEN, timestamp, nonce].sort().join("");
   const sha1 = crypto.createHash("sha1").update(raw).digest("hex");
-
   return sha1 === signature;
 }
 
@@ -44,248 +31,167 @@ function parseWechatXml(xml) {
   return parsed.xml || {};
 }
 
-function getMsgKey(msg) {
-  return msg.MsgId || `${msg.FromUserName}:${msg.CreateTime}:${msg.Content || ""}`;
-}
+function buildTextReply(toUser, fromUser, content) {
+  const now = Math.floor(Date.now() / 1000);
 
-async function getWechatAccessToken() {
-  const now = Date.now();
-
-  if (cachedAccessToken && now < cachedAccessTokenExpireAt) {
-    return cachedAccessToken;
-  }
-
-  const url =
-    `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential` +
-    `&appid=${WECHAT_APP_ID}` +
-    `&secret=${WECHAT_APP_SECRET}`;
-
-  const resp = await fetch(url);
-  const data = await resp.json();
-
-  console.log("get access_token result:", JSON.stringify(data));
-
-  if (!data.access_token) {
-    throw new Error(`get access_token failed: ${JSON.stringify(data)}`);
-  }
-
-  cachedAccessToken = data.access_token;
-  cachedAccessTokenExpireAt = now + 7000 * 1000;
-
-  return cachedAccessToken;
-}
-
-async function sendWechatCustomerMessage(openid, content) {
-  const accessToken = await getWechatAccessToken();
-
-  const url =
-    `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${accessToken}`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json; charset=utf-8"
-    },
-    body: JSON.stringify({
-      touser: openid,
-      msgtype: "text",
-      text: {
-        content: String(content || "").slice(0, 2000)
-      }
-    })
-  });
-
-  const data = await resp.json();
-
-  console.log("custom send result:", JSON.stringify(data));
-
-  if (data.errcode && data.errcode !== 0) {
-    throw new Error(`custom send failed: ${JSON.stringify(data)}`);
-  }
-
-  return data;
+  return `
+<xml>
+<ToUserName><![CDATA[${toUser}]]></ToUserName>
+<FromUserName><![CDATA[${fromUser}]]></FromUserName>
+<CreateTime>${now}</CreateTime>
+<MsgType><![CDATA[text]]></MsgType>
+<Content><![CDATA[${content}]]></Content>
+</xml>
+`.trim();
 }
 
 async function callCoze(userId, text) {
-  console.log("calling coze:", userId, text);
+  const controller = new AbortController();
 
-  const resp = await fetch(`${COZE_API_BASE.replace(/\/$/, "")}/v3/chat`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${COZE_API_TOKEN}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      bot_id: COZE_BOT_ID,
-      user_id: userId,
-      stream: true,
-      auto_save_history: true,
-      additional_messages: [
-        {
-          role: "user",
-          content: text,
-          content_type: "text"
-        }
-      ]
-    })
-  });
-
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => "");
-    throw new Error(`Coze HTTP ${resp.status}: ${body.slice(0, 500)}`);
-  }
-
-  const sseText = await resp.text();
-
-  let finalAnswer = "";
-  let deltaAnswer = "";
-
-  for (const block of sseText.split(/\n\n+/)) {
-    const lines = block.split("\n");
-
-    const eventLine = lines.find(line => line.startsWith("event:"));
-    const dataLine = lines.find(line => line.startsWith("data:"));
-
-    if (!dataLine) continue;
-
-    const eventName = eventLine
-      ? eventLine.replace(/^event:\s*/, "").trim()
-      : "";
-
-    const rawData = dataLine.replace(/^data:\s*/, "").trim();
-
-    if (!rawData || rawData === "[DONE]") continue;
-
-    let data;
-    try {
-      data = JSON.parse(rawData);
-    } catch {
-      continue;
-    }
-
-    if (eventName === "conversation.message.delta") {
-      if (data.type === "answer" && data.content) {
-        deltaAnswer += data.content;
-      }
-    }
-
-    if (eventName === "conversation.message.completed") {
-      if (data.type === "answer" && data.content) {
-        finalAnswer = data.content;
-      }
-    }
-  }
-
-  const answer = (finalAnswer || deltaAnswer || "我没有生成有效回复，请换个说法再试一次。")
-    .trim()
-    .slice(0, 2000);
-
-  console.log("coze answer:", answer);
-
-  return answer;
-}
-
-async function processMessage(msg) {
-  const openid = msg.FromUserName;
-  const text = String(msg.Content || "").trim();
-
-  console.log("processMessage started:", {
-    openid,
-    text,
-    msgType: msg.MsgType
-  });
-
-  if (!text) return;
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 4500);
 
   try {
-    await sendWechatCustomerMessage(openid, WAITING_REPLY);
+    const resp = await fetch(
+      `${COZE_API_BASE.replace(/\/$/, "")}/v3/chat`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${COZE_API_TOKEN}`,
+          "Content-Type": "application/json"
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          bot_id: COZE_BOT_ID,
+          user_id: userId,
+          stream: true,
+          auto_save_history: true,
+          additional_messages: [
+            {
+              role: "user",
+              content: text,
+              content_type: "text"
+            }
+          ]
+        })
+      }
+    );
 
-    const answer = await callCoze(openid, text);
-
-    await sendWechatCustomerMessage(openid, answer);
-  } catch (err) {
-    console.error("processMessage error:", err);
-
-    try {
-      await sendWechatCustomerMessage(openid, ERROR_REPLY);
-    } catch (sendErr) {
-      console.error("send error reply failed:", sendErr);
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`Coze HTTP ${resp.status}: ${body}`);
     }
+
+    const sseText = await resp.text();
+
+    let finalAnswer = "";
+    let deltaAnswer = "";
+
+    for (const block of sseText.split(/\n\n+/)) {
+      const lines = block.split("\n");
+
+      const eventLine = lines.find(i => i.startsWith("event:"));
+      const dataLine = lines.find(i => i.startsWith("data:"));
+
+      if (!dataLine) continue;
+
+      const eventName = eventLine
+        ? eventLine.replace(/^event:\s*/, "").trim()
+        : "";
+
+      const rawData = dataLine.replace(/^data:\s*/, "").trim();
+
+      if (!rawData || rawData === "[DONE]") continue;
+
+      let data;
+
+      try {
+        data = JSON.parse(rawData);
+      } catch {
+        continue;
+      }
+
+      if (
+        eventName === "conversation.message.delta" &&
+        data.type === "answer"
+      ) {
+        deltaAnswer += data.content || "";
+      }
+
+      if (
+        eventName === "conversation.message.completed" &&
+        data.type === "answer"
+      ) {
+        finalAnswer = data.content || "";
+      }
+    }
+
+    return (
+      finalAnswer ||
+      deltaAnswer ||
+      "我暂时没有生成有效回复，请稍后再试。"
+    ).slice(0, 2000);
+
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-app.get("/", (req, res) => {
-  res.type("text/plain").send("ok");
-});
-
 app.get("/healthz", (req, res) => {
-  res.json({
-    ok: true,
-    time: new Date().toISOString()
-  });
+  res.json({ ok: true });
 });
 
 app.get("/wechat", (req, res) => {
   const { signature, timestamp, nonce, echostr } = req.query;
 
-  console.log("wechat verify GET:", {
-    signature,
-    timestamp,
-    nonce,
-    echostr
-  });
-
   if (!checkWechatSignature(signature, timestamp, nonce)) {
-    return res.status(403).type("text/plain").send("invalid signature");
+    return res.status(403).send("invalid signature");
   }
 
-  return res.type("text/plain").send(echostr || "");
+  return res.send(echostr || "");
 });
 
 app.post("/wechat", async (req, res) => {
   const { signature, timestamp, nonce } = req.query;
 
-  console.log("wechat POST received");
-
   if (!checkWechatSignature(signature, timestamp, nonce)) {
-    console.log("invalid wechat signature");
-    return res.status(403).type("text/plain").send("invalid signature");
+    return res.status(403).send("invalid signature");
   }
-
-  let msg;
 
   try {
-    msg = parseWechatXml(req.body);
-    console.log("parsed message:", JSON.stringify(msg));
-  } catch (err) {
-    console.error("xml parse error:", err);
-    return res.type("text/plain").send("success");
-  }
+    const msg = parseWechatXml(req.body);
 
-  if (!msg || !msg.FromUserName || !msg.ToUserName) {
-    console.log("empty or invalid message");
-    return res.type("text/plain").send("success");
-  }
+    console.log("parsed msg:", msg);
 
-  if (msg.MsgType === "text") {
-    const key = getMsgKey(msg);
-
-    if (!processing.has(key)) {
-      processing.set(key, Date.now());
-
-      processMessage(msg).finally(() => {
-        setTimeout(() => {
-          processing.delete(key);
-        }, 5 * 60 * 1000);
-      });
-    } else {
-      console.log("duplicate message ignored:", key);
+    if (msg.MsgType !== "text") {
+      return res.send("success");
     }
-  } else {
-    console.log("non-text message ignored:", msg.MsgType);
-  }
 
-  return res.type("text/plain").send("success");
+    const answer = await callCoze(
+      msg.FromUserName,
+      msg.Content || ""
+    );
+
+    const xml = buildTextReply(
+      msg.FromUserName,
+      msg.ToUserName,
+      answer
+    );
+
+    return res.type("application/xml").send(xml);
+
+  } catch (err) {
+    console.error(err);
+
+    const fallbackXml = buildTextReply(
+      "user",
+      "gh_xxx",
+      "我思考时间有点长，请稍后再试。"
+    );
+
+    return res.type("application/xml").send(fallbackXml);
+  }
 });
 
 app.listen(PORT, () => {
