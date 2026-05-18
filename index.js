@@ -90,11 +90,13 @@ async function sendWechatCustomerMessage(openid, content) {
       }
     })
   });
+const data = await resp.json();
 
-  const data = await resp.json();
+console.log("custom send result:", JSON.stringify(data));
 
-  if (data.errcode && data.errcode !== 0) {
-    throw new Error(`custom send failed: ${JSON.stringify(data)}`);
+if (data.errcode && data.errcode !== 0) {
+  throw new Error(`custom send failed: ${JSON.stringify(data)}`);
+}
   }
 
   return data;
