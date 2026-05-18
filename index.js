@@ -32,8 +32,10 @@ const processing = new Map();
 
 function checkWechatSignature(signature, timestamp, nonce) {
   if (!signature || !timestamp || !nonce || !WECHAT_TOKEN) return false;
+
   const raw = [WECHAT_TOKEN, timestamp, nonce].sort().join("");
   const sha1 = crypto.createHash("sha1").update(raw).digest("hex");
+
   return sha1 === signature;
 }
 
@@ -60,6 +62,8 @@ async function getWechatAccessToken() {
 
   const resp = await fetch(url);
   const data = await resp.json();
+
+  console.log("get access_token result:", JSON.stringify(data));
 
   if (!data.access_token) {
     throw new Error(`get access_token failed: ${JSON.stringify(data)}`);
@@ -90,19 +94,21 @@ async function sendWechatCustomerMessage(openid, content) {
       }
     })
   });
-const data = await resp.json();
 
-console.log("custom send result:", JSON.stringify(data));
+  const data = await resp.json();
 
-if (data.errcode && data.errcode !== 0) {
-  throw new Error(`custom send failed: ${JSON.stringify(data)}`);
-}
+  console.log("custom send result:", JSON.stringify(data));
+
+  if (data.errcode && data.errcode !== 0) {
+    throw new Error(`custom send failed: ${JSON.stringify(data)}`);
   }
 
   return data;
 }
 
 async function callCoze(userId, text) {
+  console.log("calling coze:", userId, text);
+
   const resp = await fetch(`${COZE_API_BASE.replace(/\/$/, "")}/v3/chat`, {
     method: "POST",
     headers: {
@@ -136,6 +142,7 @@ async function callCoze(userId, text) {
 
   for (const block of sseText.split(/\n\n+/)) {
     const lines = block.split("\n");
+
     const eventLine = lines.find(line => line.startsWith("event:"));
     const dataLine = lines.find(line => line.startsWith("data:"));
 
@@ -169,27 +176,40 @@ async function callCoze(userId, text) {
     }
   }
 
-  return (finalAnswer || deltaAnswer || "我没有生成有效回复，请换个说法再试一次。")
+  const answer = (finalAnswer || deltaAnswer || "我没有生成有效回复，请换个说法再试一次。")
     .trim()
     .slice(0, 2000);
+
+  console.log("coze answer:", answer);
+
+  return answer;
 }
 
 async function processMessage(msg) {
   const openid = msg.FromUserName;
   const text = String(msg.Content || "").trim();
 
+  console.log("processMessage started:", {
+    openid,
+    text,
+    msgType: msg.MsgType
+  });
+
   if (!text) return;
 
   try {
     await sendWechatCustomerMessage(openid, WAITING_REPLY);
+
     const answer = await callCoze(openid, text);
+
     await sendWechatCustomerMessage(openid, answer);
   } catch (err) {
-    console.error(err);
+    console.error("processMessage error:", err);
+
     try {
       await sendWechatCustomerMessage(openid, ERROR_REPLY);
     } catch (sendErr) {
-      console.error(sendErr);
+      console.error("send error reply failed:", sendErr);
     }
   }
 }
@@ -199,11 +219,21 @@ app.get("/", (req, res) => {
 });
 
 app.get("/healthz", (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    time: new Date().toISOString()
+  });
 });
 
 app.get("/wechat", (req, res) => {
   const { signature, timestamp, nonce, echostr } = req.query;
+
+  console.log("wechat verify GET:", {
+    signature,
+    timestamp,
+    nonce,
+    echostr
+  });
 
   if (!checkWechatSignature(signature, timestamp, nonce)) {
     return res.status(403).type("text/plain").send("invalid signature");
@@ -215,19 +245,25 @@ app.get("/wechat", (req, res) => {
 app.post("/wechat", async (req, res) => {
   const { signature, timestamp, nonce } = req.query;
 
+  console.log("wechat POST received");
+
   if (!checkWechatSignature(signature, timestamp, nonce)) {
+    console.log("invalid wechat signature");
     return res.status(403).type("text/plain").send("invalid signature");
   }
 
   let msg;
+
   try {
     msg = parseWechatXml(req.body);
+    console.log("parsed message:", JSON.stringify(msg));
   } catch (err) {
     console.error("xml parse error:", err);
     return res.type("text/plain").send("success");
   }
 
   if (!msg || !msg.FromUserName || !msg.ToUserName) {
+    console.log("empty or invalid message");
     return res.type("text/plain").send("success");
   }
 
@@ -238,9 +274,15 @@ app.post("/wechat", async (req, res) => {
       processing.set(key, Date.now());
 
       processMessage(msg).finally(() => {
-        setTimeout(() => processing.delete(key), 5 * 60 * 1000);
+        setTimeout(() => {
+          processing.delete(key);
+        }, 5 * 60 * 1000);
       });
+    } else {
+      console.log("duplicate message ignored:", key);
     }
+  } else {
+    console.log("non-text message ignored:", msg.MsgType);
   }
 
   return res.type("text/plain").send("success");
